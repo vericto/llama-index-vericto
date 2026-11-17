@@ -1,0 +1,117 @@
+# Publish to PyPI when a version tag (v0.1.0, ...) is pushed.
+#
+# PyPI trusted publishing (OIDC): no API token is stored anywhere. Before the first
+# tag, add a "pending publisher" on https://pypi.org/manage/account/publishing/ with
+#   PyPI project name: llama-index-tools-vericto   owner: vericto   repository: llama-index-vericto
+#   workflow name: release.yml                     environment name: pypi
+# and create the `pypi` environment in the repository settings (required
+# reviewers vericto and donkan168, deployments from v* tags only).
+#
+# GitHub-hosted runners on purpose: they are what PyPI trusted publishing and the
+# PEP 740 (Sigstore) attestations are documented for.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.10.8"
+  VERICTO_CLI_VERSION: "2.3.0"
+  # sha256 of vericto-cli-x86_64-unknown-linux-musl.tar.xz in the v2.3.0 release.
+  VERICTO_CLI_SHA256: "edc257e9bbbf83cda194c324b3df112f54576bde54a3c8bbace405a19ff613fa"
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+      - name: Tag, version, CHANGELOG, and no development-only dependency override
+        run: python3 scripts/check_release.py "${GITHUB_REF_NAME}"
+      - name: Install Vericto CLI (release asset, SHA-256 verified)
+        run: |
+          set -euo pipefail
+          asset=vericto-cli-x86_64-unknown-linux-musl.tar.xz
+          base="https://github.com/vericto/vericto-cli/releases/download/v$VERICTO_CLI_VERSION"
+          dir="$RUNNER_TEMP/vericto-cli"
+          mkdir -p "$dir"
+          cd "$dir"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$asset" "$base/$asset"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$asset.sha256" "$base/$asset.sha256"
+          echo "$VERICTO_CLI_SHA256  $asset" | sha256sum -c -
+          test "$(cut -d' ' -f1 "$asset.sha256")" = "$VERICTO_CLI_SHA256"
+          tar -xJf "$asset"
+          bin="$dir/vericto-cli-x86_64-unknown-linux-musl/vericto"
+          test "$("$bin" --version)" = "vericto $VERICTO_CLI_VERSION"
+          echo "VERICTO_CLI=$bin" >> "$GITHUB_ENV"
+      - run: uv sync --locked
+      - run: make lint
+      - run: make test
+      - name: Integration tests (offline engine)
+        env:
+          VERICTO_REQUIRE_CLI: "1"
+        run: make integration_test
+      - name: sdist, wheel and twine check
+        run: make build
+      - name: Install the wheel with its PyPI dependencies in a clean environment and run the quickstart
+        run: |
+          set -euo pipefail
+          wheel="$(ls "$PWD"/dist/*.whl)"
+          example="$PWD/examples/quickstart.py"
+          cd "$RUNNER_TEMP"
+          uv venv --no-config --python 3.13 clean-venv
+          uv pip install --no-config --python clean-venv "llama-index-tools-vericto @ file://$wheel"
+          clean-venv/bin/python -I "$example"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/llama-index-tools-vericto/
+    permissions:
+      id-token: write   # trusted publishing + PEP 740 attestations
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  github-release:
+    name: GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Create the release with the built files and their checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS)
+          gh release create "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" --notes "See CHANGELOG.md for what changed."

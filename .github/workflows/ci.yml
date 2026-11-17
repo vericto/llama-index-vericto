@@ -1,0 +1,157 @@
+# Lint, type-check, test and build on every PR into main and every push to main.
+#
+# Runners: a private repository runs on Vericto's self-hosted spot runners
+# (CI_RUNS_ON overrides them); a public one always runs on GitHub-hosted runners
+# (CI_RUNS_ON_PUBLIC, default "ubuntu-latest"), so a pull request from a fork can
+# never reach self-hosted hardware.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      online:
+        description: "Also run the online integration tests (needs the VERICTO_API_KEY and VERICTO_DATABASE_ID secrets; spends workspace quota)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.10.8"
+
+jobs:
+  lint:
+    name: Lint and type-check
+    runs-on: ${{ github.event.repository.private && fromJSON(vars.CI_RUNS_ON || '["self-hosted","linux","x64","vericto-spot"]') || fromJSON(vars.CI_RUNS_ON_PUBLIC || '"ubuntu-latest"') }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+      - run: uv sync --locked
+      - run: make lint
+      - run: make check_imports
+
+  test:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ${{ github.event.repository.private && fromJSON(vars.CI_RUNS_ON || '["self-hosted","linux","x64","vericto-spot"]') || fromJSON(vars.CI_RUNS_ON_PUBLIC || '"ubuntu-latest"') }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported, a middle one, and the newest.
+        python: ["3.11", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      # Unit tests, no network.
+      - run: make test
+
+  integration-offline:
+    # The real engine, offline: the Vericto CLI release binary, its SHA-256 pinned
+    # here and checked against the release's .sha256 before it is extracted (as in
+    # vericto-python). VERICTO_REQUIRE_CLI makes a missing CLI a failure.
+    name: Integration (offline engine)
+    runs-on: ${{ github.event.repository.private && fromJSON(vars.CI_RUNS_ON || '["self-hosted","linux","x64","vericto-spot"]') || fromJSON(vars.CI_RUNS_ON_PUBLIC || '"ubuntu-latest"') }}
+    timeout-minutes: 10
+    env:
+      VERICTO_CLI_VERSION: "2.3.0"
+      # sha256 of vericto-cli-x86_64-unknown-linux-musl.tar.xz in the v2.3.0 release.
+      VERICTO_CLI_SHA256: "edc257e9bbbf83cda194c324b3df112f54576bde54a3c8bbace405a19ff613fa"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+      - name: Install Vericto CLI (release asset, SHA-256 verified)
+        run: |
+          set -euo pipefail
+          asset=vericto-cli-x86_64-unknown-linux-musl.tar.xz
+          base="https://github.com/vericto/vericto-cli/releases/download/v$VERICTO_CLI_VERSION"
+          dir="$RUNNER_TEMP/vericto-cli"
+          mkdir -p "$dir"
+          cd "$dir"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$asset" "$base/$asset"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$asset.sha256" "$base/$asset.sha256"
+          # Hard gate before extracting: the pinned digest, and the release's own checksum file.
+          echo "$VERICTO_CLI_SHA256  $asset" | sha256sum -c -
+          test "$(cut -d' ' -f1 "$asset.sha256")" = "$VERICTO_CLI_SHA256"
+          tar -xJf "$asset"
+          bin="$dir/vericto-cli-x86_64-unknown-linux-musl/vericto"
+          test "$("$bin" --version)" = "vericto $VERICTO_CLI_VERSION"
+          echo "VERICTO_CLI=$bin" >> "$GITHUB_ENV"
+      - run: uv sync --locked
+      - name: Integration tests (offline)
+        env:
+          VERICTO_REQUIRE_CLI: "1"
+        run: make integration_test
+      - name: Quickstart example (offline)
+        run: uv run python examples/quickstart.py
+
+  integration-online:
+    # Opt-in only (workflow_dispatch with online=true): it spends evaluations from
+    # the workspace's monthly quota, and fork PRs never get the secrets anyway.
+    name: Integration (online)
+    if: github.event_name == 'workflow_dispatch' && inputs.online
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+      - run: uv sync --locked
+      - name: Integration tests (online)
+        env:
+          VERICTO_API_KEY: ${{ secrets.VERICTO_API_KEY }}
+          VERICTO_DATABASE_ID: ${{ secrets.VERICTO_DATABASE_ID }}
+        run: uv run pytest -v tests/integration_tests/test_online.py
+
+  build:
+    name: Build
+    runs-on: ${{ github.event.repository.private && fromJSON(vars.CI_RUNS_ON || '["self-hosted","linux","x64","vericto-spot"]') || fromJSON(vars.CI_RUNS_ON_PUBLIC || '"ubuntu-latest"') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+      - name: sdist, wheel and twine check
+        run: make build
+      - name: The wheel carries the type marker and the license files, no namespace __init__.py and nothing from tests
+        run: |
+          set -euo pipefail
+          listing=$(unzip -l dist/*.whl)
+          grep -q "llama_index/tools/vericto/py.typed" <<<"$listing"
+          grep -q "licenses/LICENSE" <<<"$listing"
+          grep -q "licenses/NOTICE" <<<"$listing"
+          ! grep -qE " llama_index/__init__.py| llama_index/tools/__init__.py" <<<"$listing"
+          ! grep -q "tests/" <<<"$listing"
