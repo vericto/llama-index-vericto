@@ -124,7 +124,7 @@ db = VerictoSQLDatabase.from_uri("sqlite:///shop.db", offline=True)
 
 agent = FunctionAgent(
     tools=VerictoToolSpec(db).to_tool_list(),  # check_sql, run_sql, list_tables, describe_tables
-    llm=Anthropic(model="claude-sonnet-4-6"),  # any function-calling LLM
+    llm=Anthropic(model="claude-sonnet-5-5"),  # any function-calling LLM
     system_prompt=(
         "You answer questions about the shop database. Check every query with "
         "check_sql before running it, and never run a blocked query."
